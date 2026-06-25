@@ -8,3 +8,4 @@ tiktoken
 sentence-transformers
 langgraph
 python-dotenv
+IPython
