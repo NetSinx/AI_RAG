@@ -15,6 +15,7 @@ from langgraph.graph import MessagesState
 from langchain_docling.loader import DoclingLoader
 from langchain_community.vectorstores.utils import filter_complex_metadata
 from dataclasses import dataclass
+import hashlib
 from litestar import Litestar, post
 from litestar.datastructures import UploadFile
 from litestar.params import MultipartBody
@@ -35,15 +36,43 @@ class FormInput:
 
 async def run_agentic_rag(query: str, temp_file_path: str) -> AsyncGenerator[bytes, None]:
     try:
-        yield encode_json({"status": "loading document"}) + b"\n"
+        yield encode_json({"status": "Loading Document..."}) + b"\n"
+        
+        def create_vectorstore():
+            vector_store = Chroma(
+                embedding_function=HuggingFaceEmbeddings(
+                    model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+                    encode_kwargs={"normalize_embeddings": True},
+                ),
+                persist_directory="./chroma_db"
+            )
+
+            return vector_store
+        
+        vectorstore = await asyncio.to_thread(create_vectorstore)
         
         def load_doc():
-            loader = DoclingLoader(file_path=temp_file_path)
-            return loader.load()
+            file_id = hashlib.sha256(temp_file_path.encode()).hexdigest()
+            existing_docs = vectorstore.get(where={"source_file_id": file_id})
+
+            if existing_docs["ids"]:
+                print("Dokumen sudah ada di Chroma DB. Proses DoclingLoader dilewati!")
+                return existing_docs
+            else:
+                print("Dokumen baru ditemukan. Menjalankan DoclingLoader...")
+                
+                loader = DoclingLoader(file_path=temp_file_path)
+                documents = loader.load()
+                
+                for doc in documents:
+                    doc.metadata["source_file_id"] = file_id
+                    
+                vectorstore.add_documents(documents)
+                return documents
             
         documents = await asyncio.to_thread(load_doc)
 
-        yield encode_json({"status": "embedding document"}) + b"\n"
+        yield encode_json({"status": "Embedding Document..."}) + b"\n"
 
         text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
             chunk_size=1000,
@@ -52,22 +81,11 @@ async def run_agentic_rag(query: str, temp_file_path: str) -> AsyncGenerator[byt
 
         doc_splits = text_splitter.split_documents(documents)
         doc_splits = filter_complex_metadata(doc_splits)
-
-        def create_vectorstore():
-            return Chroma.from_documents(
-                documents=doc_splits,
-                embedding=HuggingFaceEmbeddings(
-                    model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-                    encode_kwargs={"normalize_embeddings": True},
-                ),
-            )
-        vectorstore = await asyncio.to_thread(create_vectorstore)
-        retriever = vectorstore.as_retriever()
         
         @tool
         async def retrieve_information_by_document(query: str) -> str:
             """Mencari informasi yang relevan dari dokumen menggunakan query teks."""
-            retrieved_docs = await retriever.ainvoke(query)
+            retrieved_docs = vectorstore.similarity_search(query, k=2)
             return "\n\n".join([doc.page_content for doc in retrieved_docs])
 
         retriever_tool = retrieve_information_by_document
@@ -148,27 +166,17 @@ async def run_agentic_rag(query: str, temp_file_path: str) -> AsyncGenerator[byt
        
         graph = init_workflow(generate_query_or_respond, retriever_tool, rewrite_question, generate_answer, grade_documents)
         
-        yield encode_json({"status": "thinking"}) + b"\n"
+        yield encode_json({"status": "Thinking..."}) + b"\n"
 
-        async for mode, data in graph.astream(
+        async for event in graph.astream_events(
             {
-                "messages": [{"role": "user", "content": query}]
-            },
-            stream_mode=["messages", "updates"],
+                "messages": [
+                    {"role": "user", "content": query}
+                ]
+            }
         ):
-            if mode == "messages":
-                msg, metadata = data
-                if msg.__class__.__name__ == "AIMessageChunk":
-                    if msg.content and isinstance(msg.content, str):
-                        yield encode_json({"message": msg.content}) + b"\n"
-                    elif msg.content and isinstance(msg.content, list):
-                        text = "".join(c.get("text", "") for c in msg.content if isinstance(c, dict) and "text" in c)
-                        if text:
-                            yield encode_json({"message": text}) + b"\n"
-            elif mode == "updates":
-                node_name = list(data.keys())[0]
-                yield encode_json({"status": f"executing {node_name}"}) + b"\n"
-
+            if event["event"] == "on_chat_model_stream":
+                yield encode_json({"message": event["data"]["chunk"].text}) + b"\n"
     except Exception as e:
         traceback.print_exc()
         yield encode_json({"error": str(e)}) + b"\n"
@@ -189,6 +197,6 @@ async def chat(data: MultipartBody[FormInput]) -> Stream:
 
     return Stream(run_agentic_rag(data.query, temp_file_path))
 
-cors_config = CORSConfig(allow_origins=["http://localhost:5173"])
+cors_config = CORSConfig(allow_origins=["*"])
 
 app = Litestar(route_handlers=[chat], cors_config=cors_config, debug=True)
