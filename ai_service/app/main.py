@@ -36,8 +36,6 @@ class FormInput:
 
 async def run_agentic_rag(query: str, temp_file_path: str, filename: str) -> AsyncGenerator[bytes, None]:
     try:
-        yield encode_json({"status": "Loading Document..."}) + b"\n"
-        
         def create_vectorstore():
             vector_store = Chroma(
                 embedding_function=HuggingFaceEmbeddings(
@@ -59,10 +57,14 @@ async def run_agentic_rag(query: str, temp_file_path: str, filename: str) -> Asy
                 print("Dokumen sudah ada di Chroma DB. Proses DoclingLoader dilewati!")
                 return existing_docs['documents']
             else:
+                yield encode_json({"status": "Loading Document..."}) + b"\n"
+
                 print("Dokumen baru ditemukan. Menjalankan DoclingLoader...")
                 
                 loader = DoclingLoader(file_path=temp_file_path)
                 documents = loader.load()
+
+                yield encode_json({"status": "Embedding Document..."}) + b"\n"
 
                 text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
                     chunk_size=1000,
@@ -80,8 +82,6 @@ async def run_agentic_rag(query: str, temp_file_path: str, filename: str) -> Asy
                 return documents
             
         await asyncio.to_thread(load_doc)
-        
-        yield encode_json({"status": "Embedding Document..."}) + b"\n"
         
         @tool
         async def retrieve_information_by_document(query: str) -> str:
